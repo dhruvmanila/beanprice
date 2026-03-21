@@ -511,6 +511,7 @@ def fetch_source_price_series(source, symbol, dates):
     if uses_series and dates:
         time_begin = min(query_times.values()) - datetime.timedelta(days=7)
         time_end = max(query_times.values())
+        logging.info("Fetching: %s (time: %s to %s)", symbol, time_begin, time_end)
         series = source.get_prices_series(symbol, time_begin, time_end)
         if series is not None:
             series = [srcprice for srcprice in series if srcprice.time is not None]
