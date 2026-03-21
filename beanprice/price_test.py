@@ -311,6 +311,57 @@ class TestTimezone(unittest.TestCase):
             )
 
 
+class TestBatchFetching(unittest.TestCase):
+    def test_fetch_price_group_uses_series_once(self):
+        class MockSource:
+            historical_calls = 0
+            series_calls = 0
+
+            def get_historical_price(self, ticker, time):
+                type(self).historical_calls += 1
+                return None
+
+            def get_prices_series(self, ticker, time_begin, time_end):
+                type(self).series_calls += 1
+                return [
+                    SourcePrice(
+                        Decimal("10.00"),
+                        datetime.datetime(2021, 1, 4, 21, 0, tzinfo=tz.tzutc()),
+                        "USD",
+                    ),
+                    SourcePrice(
+                        Decimal("11.00"),
+                        datetime.datetime(2021, 1, 5, 21, 0, tzinfo=tz.tzutc()),
+                        "USD",
+                    ),
+                    SourcePrice(
+                        Decimal("12.00"),
+                        datetime.datetime(2021, 1, 6, 21, 0, tzinfo=tz.tzutc()),
+                        "USD",
+                    ),
+                ]
+
+        module = types.SimpleNamespace(Source=MockSource)
+        dprices = [
+            price.DatedPrice(
+                "QQQ",
+                "USD",
+                datetime.date(2021, 1, day),
+                [price.PriceSource(module, "QQQ", False)],
+            )
+            for day in (4, 5, 6)
+        ]
+
+        entries = price.fetch_price_group(dprices)
+
+        self.assertEqual(1, MockSource.series_calls)
+        self.assertEqual(0, MockSource.historical_calls)
+        self.assertEqual(
+            [Decimal("10.00"), Decimal("11.00"), Decimal("12.00")],
+            [entry.amount.number for entry in entries],
+        )
+
+
 class TestInverted(unittest.TestCase):
     def setUp(self):
         fetch_cached = mock.patch("beanprice.price.fetch_cached_price").start()

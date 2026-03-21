@@ -201,7 +201,7 @@ class Source(source.Source):
 
         return source.SourcePrice(price, data_dt, currency)
 
-    def get_daily_prices(
+    def get_prices_series(
         self, ticker: str, time_begin: datetime, time_end: datetime
     ) -> Optional[List[source.SourcePrice]]:
         """See contract in beanprice.source.Source."""

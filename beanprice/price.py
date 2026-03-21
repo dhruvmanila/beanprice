@@ -7,6 +7,7 @@ import argparse
 import collections
 import datetime
 import functools
+import itertools
 from os import path
 import os
 import tempfile
@@ -32,6 +33,7 @@ from beancount.ops import find_prices
 
 from beanprice import date_utils
 import beanprice
+from beanprice import source as source_lib
 
 
 # A price source.
@@ -468,6 +470,68 @@ def now():
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+def get_query_time(date):
+    """Compute the query timestamp used for historical price lookups."""
+    query_time = datetime.time(16, 0, 0)
+    time_local = datetime.datetime.combine(date, query_time, tzinfo=tz.tzlocal())
+    return time_local.astimezone(tz.tzutc())
+
+
+def get_cache_key(source, symbol, date):
+    """Compute the cache key for a source/symbol/date tuple."""
+    md5 = hashlib.md5()
+    md5.update(str((type(source).__module__, symbol, date)).encode("utf-8"))
+    return md5.hexdigest()
+
+
+def normalize_cached_result(result_naive):
+    """Restore UTC timezone information on cached source results."""
+    if result_naive is not None and result_naive.time is not None:
+        return result_naive._replace(time=result_naive.time.replace(tzinfo=tz.tzutc()))
+    return result_naive
+
+
+def serialize_cached_result(result):
+    """Convert a source result to a cache-safe representation."""
+    if result is not None and result.time is not None:
+        time_utc = result.time.astimezone(tz.tzutc())
+        time_naive = time_utc.replace(tzinfo=None)
+        return result._replace(time=time_naive)
+    return result
+
+
+def fetch_source_price_series(source, symbol, dates):
+    """Fetch multiple historical prices, using a series API when available."""
+    dates = sorted(set(dates))
+    query_times = {date: get_query_time(date) for date in dates}
+    results = {}
+
+    source_series_method = getattr(type(source), "get_prices_series", None)
+    uses_series = source_series_method is not source_lib.Source.get_prices_series
+    if uses_series and dates:
+        time_begin = min(query_times.values()) - datetime.timedelta(days=7)
+        time_end = max(query_times.values())
+        series = source.get_prices_series(symbol, time_begin, time_end)
+        if series is not None:
+            series = [srcprice for srcprice in series if srcprice.time is not None]
+            series.sort(key=lambda srcprice: srcprice.time)
+            datapoints = iter(series)
+            latest = None
+            current = next(datapoints, None)
+            for date in dates:
+                query_time = query_times[date]
+                while current is not None and current.time <= query_time:
+                    latest = current
+                    current = next(datapoints, None)
+                results[date] = latest
+
+    missing_dates = [date for date in dates if date not in results]
+    for date in missing_dates:
+        results[date] = source.get_historical_price(symbol, query_times[date])
+
+    return results
+
+
 def fetch_cached_price(source, symbol, date):
     """Call Source to fetch a price, but look and/or update the cache first.
 
@@ -484,11 +548,7 @@ def fetch_cached_price(source, symbol, date):
     """
     # Compute a suitable timestamp from the date, if specified.
     if date is not None:
-        # We query as for 4pm for the given date of the current timezone, if
-        # specified.
-        query_time = datetime.time(16, 0, 0)
-        time_local = datetime.datetime.combine(date, query_time, tzinfo=tz.tzlocal())
-        time = time_local.astimezone(tz.tzutc())
+        time = get_query_time(date)
     else:
         time = None
 
@@ -503,22 +563,11 @@ def fetch_cached_price(source, symbol, date):
     else:
         # The cache is enabled and we have to compute the current/latest price.
         # Try to fetch from the cache but miss if the price is too old.
-        md5 = hashlib.md5()
-        md5.update(str((type(source).__module__, symbol, date)).encode("utf-8"))
-        key = md5.hexdigest()
+        key = get_cache_key(source, symbol, date)
         timestamp_now = int(now().timestamp())
         try:
             timestamp_created, result_naive = _CACHE[key]
-
-            # Convert naive timezone to UTC, which is what the cache is always
-            # assumed to store. (The reason for this is that timezones from
-            # aware datetime objects cannot be serialized properly due to bug.)
-            if result_naive.time is not None:
-                result = result_naive._replace(
-                    time=result_naive.time.replace(tzinfo=tz.tzutc())
-                )
-            else:
-                result = result_naive
+            result = normalize_cached_result(result_naive)
 
             if (timestamp_now - timestamp_created) > _CACHE.expiration.total_seconds():
                 raise KeyError
@@ -534,17 +583,75 @@ def fetch_cached_price(source, symbol, date):
                 logging.error("Error fetching %s: %s", symbol, exc)
                 result = None
 
-            # Make sure the timezone is UTC and make naive before serialization.
-            if result and result.time is not None:
-                time_utc = result.time.astimezone(tz.tzutc())
-                time_naive = time_utc.replace(tzinfo=None)
-                result_naive = result._replace(time=time_naive)
-            else:
-                result_naive = result
-
+            result_naive = serialize_cached_result(result)
             if result_naive is not None:
                 _CACHE[key] = (timestamp_now, result_naive)
     return result
+
+
+def fetch_cached_price_series(source, symbol, dates):
+    """Fetch multiple historical prices with cache lookups and batch misses."""
+    dates = sorted(set(dates))
+    if _CACHE is None:
+        return fetch_source_price_series(source, symbol, dates)
+
+    timestamp_now = int(now().timestamp())
+    results = {}
+    missing_dates = []
+    for date in dates:
+        key = get_cache_key(source, symbol, date)
+        try:
+            timestamp_created, result_naive = _CACHE[key]
+            result = normalize_cached_result(result_naive)
+            if (timestamp_now - timestamp_created) > _CACHE.expiration.total_seconds():
+                raise KeyError
+            results[date] = result
+        except KeyError:
+            missing_dates.append(date)
+
+    if missing_dates:
+        try:
+            fetched_results = fetch_source_price_series(source, symbol, missing_dates)
+        except ValueError as exc:
+            logging.error("Error fetching %s: %s", symbol, exc)
+            fetched_results = {date: None for date in missing_dates}
+
+        for date, result in fetched_results.items():
+            results[date] = result
+            result_naive = serialize_cached_result(result)
+            if result_naive is not None:
+                _CACHE[get_cache_key(source, symbol, date)] = (timestamp_now, result_naive)
+
+    return results
+
+
+def source_price_to_price_entry(
+    dprice: DatedPrice,
+    psource: PriceSource,
+    srcprice: source_lib.SourcePrice,
+    swap_inverted: bool = False,
+) -> data.Price:
+    """Convert a source result into a Beancount Price entry."""
+    base = dprice.base
+    quote = dprice.quote or srcprice.quote_currency
+    price = srcprice.price
+
+    # Invert the rate if requested.
+    if psource.invert:
+        if swap_inverted:
+            base, quote = quote, base
+        else:
+            price = ONE / price
+
+    assert base is not None
+    fileloc = data.new_metadata("<{}>".format(type(psource.module).__name__), 0)
+
+    srctime = srcprice.time
+    if srctime.tzinfo is None:
+        raise ValueError("Time returned by the price source is not timezone aware.")
+    date = srctime.astimezone(tz.tzlocal()).date()
+
+    return data.Price(fileloc, date, base, amount.Amount(price, quote or UNKNOWN_CURRENCY))
 
 
 def setup_cache(cache_filename: Optional[str], clear_cache: bool):
@@ -609,33 +716,49 @@ def fetch_price(dprice: DatedPrice, swap_inverted: bool = False) -> Optional[dat
             logging.error("Could not fetch for job: %s", dprice)
         return None
 
-    base = dprice.base
-    quote = dprice.quote or srcprice.quote_currency
-    price = srcprice.price
+    return source_price_to_price_entry(dprice, psource, srcprice, swap_inverted)
 
-    # Invert the rate if requested.
-    if psource.invert:
-        if swap_inverted:
-            base, quote = quote, base
-        else:
-            price = ONE / price
 
-    assert base is not None
-    fileloc = data.new_metadata("<{}>".format(type(psource.module).__name__), 0)
+def fetch_price_group(
+    dprices: List[DatedPrice], swap_inverted: bool = False
+) -> List[data.Price]:
+    """Fetch a batch of historical prices sharing the same source configuration."""
+    if not dprices:
+        return []
+    if any(dprice.date is None for dprice in dprices):
+        return list(filter(None, (fetch_price(dprice, swap_inverted) for dprice in dprices)))
 
-    # The datetime instance is required to be aware. We always convert to the
-    # user's timezone before extracting the date. This means that if the market
-    # returns a timestamp for a particular date, once we convert to the user's
-    # timezone the returned date may be different by a day. The intent is that
-    # whatever we print is assumed coherent with the user's timezone. See
-    # discussion at
-    # https://groups.google.com/d/msg/beancount/9j1E_HLEMBQ/fYRuCQK_BwAJ
-    srctime = srcprice.time
-    if srctime.tzinfo is None:
-        raise ValueError("Time returned by the price source is not timezone aware.")
-    date = srctime.astimezone(tz.tzlocal()).date()
+    pending = list(dprices)
+    fetched_entries = {}
+    for psource in dprices[0].sources:
+        try:
+            source = psource.module.Source()
+        except AttributeError:
+            continue
 
-    return data.Price(fileloc, date, base, amount.Amount(price, quote or UNKNOWN_CURRENCY))
+        date_results = fetch_cached_price_series(
+            source, psource.symbol, [dprice.date for dprice in pending if dprice.date]
+        )
+
+        next_pending = []
+        for dprice in pending:
+            srcprice = date_results.get(dprice.date)
+            if srcprice is None:
+                next_pending.append(dprice)
+                continue
+            fetched_entries[id(dprice)] = source_price_to_price_entry(
+                dprice, psource, srcprice, swap_inverted
+            )
+
+        pending = next_pending
+        if not pending:
+            break
+
+    for dprice in pending:
+        if dprice.sources:
+            logging.error("Could not fetch for job: %s", dprice)
+
+    return [fetched_entries[id(dprice)] for dprice in dprices if id(dprice) in fetched_entries]
 
 
 def filter_redundant_prices(
@@ -963,12 +1086,24 @@ def main():
 
     # Fetch all the required prices, processing all the jobs.
     executor = futures.ThreadPoolExecutor(max_workers=args.workers)
-    price_entries = filter(
-        None,
-        executor.map(
-            functools.partial(fetch_price, swap_inverted=args.swap_inverted), jobs
-        ),
-    )
+    if args.update:
+        grouped_jobs = []
+        keyfun = lambda dprice: (dprice.base, dprice.quote, tuple(dprice.sources))
+        for _, grouped in itertools.groupby(sorted(jobs, key=keyfun), key=keyfun):
+            grouped_jobs.append(list(grouped))
+        price_entries = itertools.chain.from_iterable(
+            executor.map(
+                functools.partial(fetch_price_group, swap_inverted=args.swap_inverted),
+                grouped_jobs,
+            )
+        )
+    else:
+        price_entries = filter(
+            None,
+            executor.map(
+                functools.partial(fetch_price, swap_inverted=args.swap_inverted), jobs
+            ),
+        )
 
     # Sort them by currency, regardless of date (the dates should be close
     # anyhow, and we tend to put them in chunks in the input files anyhow).
