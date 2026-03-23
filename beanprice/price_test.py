@@ -675,6 +675,67 @@ class TestFilters(unittest.TestCase):
             {(job.base, job.quote, job.date) for job in jobs},
         )
 
+    @loader.load_doc()
+    def test_get_price_jobs_up_to_date_backfills_historical_gaps(self, entries, _, __):
+        """
+        2000-01-10 open Assets:US:Invest:VEA
+        2000-01-10 open Assets:US:Invest:Margin
+
+        2021-01-01 commodity VEA
+          price: "USD:yahoo/NASDAQ:VEA"
+
+        2021-01-04 *
+          Assets:US:Invest:VEA             200 VEA {43.22 USD}
+          Assets:US:Invest:Margin
+
+        2021-01-07 price VEA                                 41.01 USD
+
+        2021-01-07 *
+          Assets:US:Invest:VEA            -200 VEA {43.22 USD} @ 41.01 USD
+          Assets:US:Invest:Margin
+        """
+        jobs = price.get_price_jobs_up_to_date(entries, datetime.date(2021, 1, 8))
+        self.assertEqual(
+            {
+                ("VEA", "USD", datetime.date(2021, 1, 4)),
+                ("VEA", "USD", datetime.date(2021, 1, 5)),
+                ("VEA", "USD", datetime.date(2021, 1, 6)),
+            },
+            {(job.base, job.quote, job.date) for job in jobs},
+        )
+
+    @loader.load_doc()
+    def test_get_price_jobs_up_to_date_clobber_keeps_existing_dates(self, entries, _, __):
+        """
+        2000-01-10 open Assets:US:Invest:VEA
+        2000-01-10 open Assets:US:Invest:Margin
+
+        2021-01-01 commodity VEA
+          price: "USD:yahoo/NASDAQ:VEA"
+
+        2021-01-04 *
+          Assets:US:Invest:VEA             200 VEA {43.22 USD}
+          Assets:US:Invest:Margin
+
+        2021-01-07 price VEA                                 41.01 USD
+
+        2021-01-07 *
+          Assets:US:Invest:VEA            -200 VEA {43.22 USD} @ 41.01 USD
+          Assets:US:Invest:Margin
+        """
+        jobs = price.get_price_jobs_up_to_date(
+            entries, datetime.date(2021, 1, 8), clobber=True
+        )
+        self.assertEqual(
+            {
+                ("VEA", "USD", datetime.date(2021, 1, 4)),
+                ("VEA", "USD", datetime.date(2021, 1, 5)),
+                ("VEA", "USD", datetime.date(2021, 1, 6)),
+                ("VEA", "USD", datetime.date(2021, 1, 7)),
+            },
+            {(job.base, job.quote, job.date) for job in jobs},
+        )
+
 
 class TestFromFile(unittest.TestCase):
     @loader.load_doc()

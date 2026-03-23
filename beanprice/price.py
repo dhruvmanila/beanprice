@@ -25,7 +25,6 @@ from beancount.core.number import ONE
 from beancount import loader
 from beancount.core import data
 from beancount.core import amount
-from beancount.core import prices
 from beancount.core import getters
 from beancount.ops import lifetimes
 from beancount.parser import printer
@@ -350,10 +349,12 @@ def get_price_jobs_up_to_date(
     undeclared_source=None,
     update_rate="weekday",
     compress_days=1,
+    clobber=False,
 ):
-    """Get a list of trailing prices to fetch from a stream of entries.
+    """Get a list of missing historical prices to fetch from a stream of entries.
 
-    The list of dates runs from the latest available price up to the latest date.
+    The list of dates spans the relevant commodity lifetimes up to the latest
+    date, excluding already present prices unless clobber is enabled.
 
     Args:
       entries: list of Beancount entries
@@ -363,11 +364,11 @@ def get_price_jobs_up_to_date(
       undeclared_source: A string, the name of the default source module to use to
         pull prices for commodities without a price source metadata on their
         Commodity directive declaration.
+      clobber: A boolean, true if we should include dates with an existing
+        price entry.
     Returns:
       A list of DatedPrice instances.
     """
-    price_map = prices.build_price_map(entries)
-
     # Find the list of declared currencies, and from it build a mapping for
     # tickers for each (base, quote) pair. This is the only place tickers
     # appear.
@@ -414,22 +415,10 @@ def get_price_jobs_up_to_date(
         # Compress any lifetimes based on compress_days
         lifetimes_map = lifetimes.compress_lifetimes_days(lifetimes_map, compress_days)
 
-    # Trim lifetimes based on latest price dates.
+    # Trim lifetimes to the requested date range.
     for base_quote in lifetimes_map:
         intervals = lifetimes_map[base_quote]
-        result = prices.get_latest_price(price_map, base_quote)
-        if result is None or result[0] is None:
-            lifetimes_map[base_quote] = lifetimes.trim_intervals(intervals, None, date_last)
-        else:
-            latest_price_date = result[0]
-            date_first = latest_price_date + datetime.timedelta(days=1)
-            if date_first < date_last:
-                lifetimes_map[base_quote] = lifetimes.trim_intervals(
-                    intervals, date_first, date_last
-                )
-            else:
-                # We don't need to update if we're already up to date.
-                lifetimes_map[base_quote] = []
+        lifetimes_map[base_quote] = lifetimes.trim_intervals(intervals, None, date_last)
 
     # Remove currency pairs we can't fetch any prices for.
     if not default_source:
@@ -451,6 +440,15 @@ def get_price_jobs_up_to_date(
         required_prices = lifetimes.required_weekly_prices(lifetimes_map, date_last)
     else:
         raise ValueError("Invalid Update Rate")
+
+    required_prices = set(required_prices)
+    if not clobber:
+        existing_prices = {
+            (entry.date, entry.currency, entry.amount.currency)
+            for entry in entries
+            if isinstance(entry, data.Price)
+        }
+        required_prices = required_prices - existing_prices
 
     jobs = []
     # Build up the list of jobs to fetch prices for.
@@ -859,8 +857,8 @@ def process_args() -> Tuple[
         "--update",
         action="store_true",
         help=(
-            "Fetch prices from most recent price for each source "
-            "up to present day or specified --date. See also "
+            "Fetch missing prices for each source up to present day "
+            "or specified --date. See also "
             "--update-rate, --update-compress options."
         ),
     )
@@ -1052,6 +1050,7 @@ def process_args() -> Tuple[
                     args.undeclared,
                     args.update_rate,
                     args.update_compress,
+                    args.clobber,
                 )
             )
             all_entries.extend(entries)
